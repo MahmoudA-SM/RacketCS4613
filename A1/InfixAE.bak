@@ -1,0 +1,66 @@
+#lang plait
+
+#| BNF for the AE language:
+   ae: NUMBER
+       | { + ae ae }
+       | { - ae ae }
+       | { * ae ae }
+       | { / ae ae }
+|#
+
+;; AE abstract syntax trees
+(define-type AE
+  [Num (val : Number)]
+  [Add (l : AE) (r : AE)]
+  [Sub (l : AE) (r : AE)]
+  [Mul (l : AE) (r : AE)]
+  [Div (l : AE) (r : AE)])
+
+;; to convert s-expressions into AEs
+(define (parse-sx sx)
+  (let ([rec (lambda (fn sx)
+               (parse-sx (fn (s-exp->list sx))))])
+    (cond
+      [(s-exp-match? `NUMBER sx)
+       (Num (s-exp->number sx))]
+      [(s-exp-match? `(+ ANY ANY) sx)
+       (Add (rec second sx) (rec third sx))]
+      [(s-exp-match? `(ANY + ANY) sx)
+       (Add (rec first sx) (rec third sx))]
+      [(s-exp-match? `(- ANY ANY) sx)
+       (Sub (rec second sx) (rec third sx))]
+      [(s-exp-match? `(ANY - ANY) sx)
+       (Sub (rec first sx) (rec third sx))]
+      [(s-exp-match? `(* ANY ANY) sx)
+       (Mul (rec second sx) (rec third sx))]
+      [(s-exp-match? `(ANY * ANY) sx)
+       (Mul (rec first sx) (rec third sx))]
+      [(s-exp-match? `(/ ANY ANY) sx)
+       (Div (rec second sx) (rec third sx))]
+      [(s-exp-match? `(ANY / ANY) sx)
+       (Div (rec first sx) (rec third sx))]
+      [else (error 'parse-sx (to-string sx))])))
+
+;; consumes an AE and computes the corresponding number
+(define (eval expr)
+  (type-case AE expr
+    [(Num n)   n]
+    [(Add l r) (+ (eval l) (eval r))]
+    [(Sub l r) (- (eval l) (eval r))]
+    [(Mul l r) (* (eval l) (eval r))]
+    [(Div l r) (/ (eval l) (eval r))]))
+
+;; evaluate an AE program contained in an s-expr
+(define (run sx)
+  (eval (parse-sx sx)))
+
+(test (run `3)  3)
+(test (run `{+ 3 4}) 7)
+(test (run `{+ {- 3 4} 7}) 6)
+
+
+(test (run `3)  3)
+(test (run `{3 + 4})  7)
+(test (run `{{3 - 4} + 7})  6)
+(test (run `{8 * 9})  72)
+(test (run `{8 / 2})  4)

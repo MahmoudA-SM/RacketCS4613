@@ -1,0 +1,56 @@
+#lang plait #:untyped
+
+
+(define-syntax-rule (lambda/rec fun def)
+  ((lambda (f)
+     ((lambda (x) (f (lambda (n) ((x x) n))))
+      (lambda (x) (f (lambda (n) ((x x) n))))))
+   (lambda (fun) def)))
+
+
+
+
+
+(let
+    ([fact
+      (lambda/rec fact
+         (lambda (n)
+           (if (zero? n) 1
+               (* n (fact (- n 1))))))])
+  (fact 5))
+
+
+(define (fact-wrapper-0 n)
+  (let*
+      ([fact
+        (lambda/rec fact
+            (lambda (n)
+              (if (zero? n) 1
+                  (* n (fact (- n 1))))))])
+    (fact n)))
+
+
+
+
+(define (ackermann m n)
+  (cond [(zero? m) (+ n 1)]
+        [(zero? n) (ackermann (- m 1) 1)]
+        [else      (ackermann (- m 1)
+                              (ackermann m (- n 1)))]))
+  
+
+(define (curry-ackermann m)
+  (lambda (n)
+    (cond [(zero? m) (+ 1 n)]
+          [(zero? n)(ackermann (- m 1) 1)]
+          [else      (ackermann (- m 1)
+                                (ackermann m (- n 1)))])))
+
+
+
+(define ackermann-m-3 (curry-ackermann 3))
+
+(ackermann-m-3 2) ; evaluates to 29
+
+
+(test (ackermann 3 2) 29)

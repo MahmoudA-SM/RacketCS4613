@@ -1,0 +1,161 @@
+#lang plait
+(define-type PLANG
+  [Num  (val : Number)]
+  [Add  (l : PLANG) (r : PLANG)]
+  [Sub  (l : PLANG) (r : PLANG)]
+  [Mul  (l : PLANG) (r : PLANG)]
+  [Div  (l : PLANG) (r : PLANG)]
+  [Id   (name : Symbol)]
+  [Let1 (id : Symbol) (named-expr : PLANG) (bound-body : PLANG)]
+  [Param   (name : Symbol)]
+  [Parameterize (id : Symbol) (named-expr : PLANG) (bound-body : PLANG)]
+  [Lam  (param : Symbol) (body : PLANG)]
+  [Call (fun : PLANG) (val : PLANG)])
+
+(define (parse-error sx)
+  (error 'parse-sx (string-append "parse error: " (to-string sx))))
+
+(define (sx-ref sx n) (list-ref (s-exp->list sx) n))
+
+(define (parse-sx sx)
+  (local
+      [(define (px n) (parse-sx (sx-ref sx n)))
+       (define (mx? pattern) (s-exp-match? pattern sx))
+       (define (sym-ref expr n) (s-exp->symbol (sx-ref expr n)))]
+    (cond
+      [(s-exp-number? sx) (Num (s-exp->number sx))]
+      [(s-exp-symbol? sx) (Id (s-exp->symbol sx))]
+      [(mx? `(SYMBOL (SYMBOL ANY) ANY))
+       (let* ([def (sx-ref sx 1)]
+              [id (sym-ref def 0)]
+              [val (parse-sx (sx-ref def 1))]
+              [expr (parse-sx (sx-ref sx 2))])
+         (cond
+           [(mx? `(let1 (SYMBOL ANY) ANY)) (Let1 id val expr)]
+           [(mx? `(param1 (SYMBOL ANY) ANY)) (Parameterize id val expr)]))]
+      [(mx? `(lam SYMBOL ANY))
+       (let ([id (sym-ref sx 1)]
+             [body (px 2)])
+         (Lam id body))]
+    [(mx? `(+ ANY ANY)) (Add (px 1) (px 2))]
+    [(mx? `(- ANY ANY)) (Sub (px 1) (px 2))]
+    [(mx? `(* ANY ANY)) (Mul (px 1) (px 2))]
+    [(mx? `(/ ANY ANY)) (Div (px 1) (px 2))]
+    [(mx? `(ANY ANY)) (Call (px 0) (px 1))]
+    [(mx? `(SYMBOL)) (Param (sym-ref sx 0))]
+    [else (parse-error sx)])))
+
+(module+ test
+  (test (parse-sx `{x}) (Param 'x))
+  (test (parse-sx `{param1 (x 42) {x}}) (Parameterize 'x (Num 42) (Param 'x))))
+
+(define-type ENV
+  [EmptyEnv]
+  [Extend (name : Symbol) (val : VAL) (rest : ENV)])
+
+(define-type VAL
+  [NumV (n : Number)]
+  [FunV (arg : Symbol) (body : PLANG) (env : ENV)])
+(define (lookup name env)
+  (type-case ENV env
+    [(EmptyEnv) (error 'lookup (string-append "no binding for " (to-string name)))]
+    [(Extend id val rest-env)
+     (if (eq? id name) 
+	 val 
+	 (lookup name rest-env))]))
+;; gets a Racket numeric binary operator, 
+;; uses it within a NumV wrapper
+(define (arith-op op val1 val2)
+  (local 
+      [(define (NumV->number v)
+         (type-case VAL v
+           [(NumV n) n]
+           [else (error 'arith-op 
+                        (string-append "expects a number, got: " (to-string v)))]))]
+    (NumV (op (NumV->number val1) 
+	    (NumV->number val2)))))
+
+;; evaluates PLANG expressions by reducing them to values
+(define (interp expr env param_env)
+  (type-case PLANG expr
+    [(Num n) (NumV n)]
+    [(Add l r) (arith-op + (interp l env param_env) (interp r env param_env))]
+    [(Sub l r) (arith-op - (interp l env param_env) (interp r env param_env))]
+    [(Mul l r) (arith-op * (interp l env param_env) (interp r env param_env))]
+    [(Div l r) (arith-op / (interp l env param_env) (interp r env param_env))]
+    [(Parameterize bound-id named-expr bound-body)     (interp bound-body env (Extend bound-id (interp named-expr env) param_env))]
+    [(Let1 bound-id named-expr bound-body)     (interp bound-body           (Extend bound-id (interp named-expr env) env)           param_env)]
+    [(Id name) (lookup name env)]
+    [(Param name) (lookup name param_env)]
+    [(Lam bound-id bound-body)     (FunV bound-id bound-body env)]
+    [(Call fun-expr arg-expr)     (let ([fval (interp fun-expr env param_env)]
+           [arg (interp arg-expr env param_env)])
+       (type-case VAL fval
+         [(FunV arg-name body closure-env)
+          (interp body (Extend arg-name arg closure-env) EmptyEnv)]
+         [else (error 'interp (string-append "Can only call functions, but got: " (to-string fval)))]))]))
+
+
+;; evaluate a PLANG program contained in an s-expression
+  (define (run s-exp)
+    (let ([result (interp (parse-sx s-exp) (EmptyEnv))])
+      (type-case VAL result
+        [(NumV n) n]
+        [else (error 'run
+                     (string-append "evaluation returned a non-number: " (to-string result)))])))
+
+;; error handling paths
+(module+ test
+  (test/exn (parse-sx `{}) "parse error")
+  (test/exn (run `{+ x 1}) "no binding")
+  (test/exn (run `{+ 1 {lam x x}}) "expects a number")
+  (test/exn (run `{1 1}) "expects a function")
+  (test/exn (run `{lam x x}) "returned a non-number")
+  )
+
+;; lexical scope tests, from lectures
+(module+ test
+  (test (run `{let1 {x 3}
+                    {let1 {f {lam y {+ x y}}}
+                          {let1 {x 5}
+                                {f 4}}}})    7)
+  (test (run `{{let1 {x 3}
+                     {lam y {+ x y}}}
+               4})    7)
+  (test (run `{{{lam x {x 1}}
+                {lam x {lam y {+ x y}}}}
+               123})
+        124))
+
+;; Coverage tests for arithmetic
+(module+ test
+  (test (run `{* 6 7}) 42)
+  (test (run `{- 6 7}) -1)
+  (test (run `{/ 6 7}) 6/7))
+
+
+        (test (run `{param1 {x 3}
+                  {let1 {f {lam y {+ {x} y}}}
+                        {param1 {x 5}
+                              {f 4}}}})    9)
+
+        (test/exn (run `{{param1 {x 3}
+                                  {lam y {+ {x} y}}}
+                          4}) "")
+
+        (test (run `{param1 {x {lam y 3}}
+                             {param1 {x 4}
+                                     {x}}})
+               4)
+
+        (test (run `{let1 {f {lam x {param1 {y 3} {+ x {y}}}}}
+                          {param1 {y 4} {f 3}}})
+              6)
+
+        (test (run `{let1 {f {lam x {y}}}
+                           {param1 {y 42}
+                                   {f 0}}})
+               42)
+
+  
+

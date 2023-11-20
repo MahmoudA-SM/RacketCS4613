@@ -1,0 +1,625 @@
+#lang plait
+
+(module+ test
+  ;; change this to see passing tests
+  (print-only-errors #t))
+
+(define-type FLANG
+  [EmptyList]
+  [NonEmpty? (expr : FLANG)]
+  [Num (n : Number)]
+  [Add (lhs : FLANG)
+       (rhs : FLANG)]
+  [Sub (lhs : FLANG)
+       (rhs : FLANG)]
+  [Id (name : Symbol)]
+  [Cons (first : FLANG) (rest : FLANG)]
+  [First (expr : FLANG)]
+  [Rest (expr : FLANG)]
+  [Lam (param : Symbol)
+       (body : FLANG)]
+  [Call (fun-expr : FLANG)
+        (arg-expr : FLANG)]
+  [If0 (test : FLANG)
+       (then-ex : FLANG)
+       (else-ex : FLANG)])
+
+;; Code
+(define tag:Num 8)
+(define tag:Add 9)
+(define tag:Sub 10)
+(define tag:Id  11)
+(define tag:Lam 12)
+(define tag:Call 13)
+(define tag:If0 14)
+;; Values
+(define tag:NumV 15)
+(define tag:ClosureV 16)
+(define tag:Bind 17)
+(define tag:Moved 18)
+
+;; List primitives (syntax)
+(define tag:Cons 19)
+(define tag:First 20)
+(define tag:Rest 21)
+;; List related continuations
+(define tag:consSecondK 22)
+(define tag:doConsK 23)
+;; Pair values
+(define tag:ConsV 24)
+
+;; tags for first and rest evaluation
+(define tag:doFirstK 25)
+(define tag:doRestK 26)
+
+;; empty list
+(define tag:EmptyList 27)
+(define tag:EmptyListV 28)
+
+(define tag:NonEmpty? 29)
+(define tag:doNonEmpty?K 30)
+
+;; memory spaces
+
+(define MEMORY-SIZE 128)
+(define space1 (make-vector MEMORY-SIZE 0))
+(define space2 (make-vector MEMORY-SIZE 0))
+(define data-memory space1)
+(define from-memory (make-vector 0 0))
+(define code-memory (make-vector 2048 0))
+
+;; shorthands for memory reads
+(define (ref n d)
+  (vector-ref data-memory (+ n d)))
+
+(define (code-ref n d)
+  (vector-ref code-memory (+ n d)))
+
+;; registers
+
+(define code-ptr 0)
+(define data-ptr 0)
+(define k-reg 0)
+(define v-reg 0)
+(define env-reg 0)
+(define env2-reg 0)
+(define result-reg 0)
+(define PC 0)
+(define updated-ptr 0)
+
+;; debugging macros
+
+(define-syntax-rule (display* thing ...)
+  (begin (display thing) ...))
+
+(define trace-level (make-parameter 0))
+
+(define-syntax-rule (store! register expr)
+  (let ([value expr])
+    (begin
+      (when (> (parameter-ref trace-level) 1)
+        (display* (symbol->string (quote register))
+                  " <- " (to-string value) "\n"))
+      (set! register value))))
+
+(define (bctrace where)
+  (when (> (parameter-ref trace-level) 0)
+    (display* "\n" where
+              "\nPC " PC
+              "\nv-reg " v-reg
+              "\nk-reg " k-reg
+              "\nresult-reg " result-reg
+              "\nptr " data-ptr
+              "\nmemory " data-memory "\n")))
+
+;; tests for debugging macro coverage
+(module+ test
+  (test (display* "" "" "") (void))
+  ;; this is a bit tricky, it needs to call store! indirectly
+  (test (parameterize ([trace-level 2]) (reset!)) (void))
+  (test (parameterize ([trace-level 2]) (bctrace 'tests)) (void))
+  )
+
+;; control flow macros
+
+(define-syntax-rule (case* v [(tv ...) ex ...] ...)
+  (let ([the-v v]) ; prevent repeated evaluation
+    (cond
+      [(member the-v (list tv ...))
+       (begin ex ...)] ...
+      [else (error 'case* (string-append "unhandled value: " (to-string v)))])))
+
+(module+ test
+  (test/exn (case* 3) "unhandled"))
+  
+;; vector utilities
+
+(define (vector-set-elements! vec offset data)
+  (when (not (empty? data))
+    (vector-set! vec offset (first data))
+    (vector-set-elements! vec
+                          (add1 offset) (rest data))))
+
+(define (vector-elements vec start n)
+  (local [(define (helper off count acc)
+            (cond
+              [(<= count 0) acc]
+              [else (helper (add1 off) (sub1 count) (cons (vector-ref vec off) acc))]))]
+    (reverse (helper start n empty))))
+
+;; memory allocation
+
+(define (code-mallocf data)
+  (let* ([old code-ptr]
+         [new (+ old (length data))])
+    (begin
+      (when (>= new (vector-length code-memory))
+        (error 'malloc "out of memory"))
+      (vector-set-elements! code-memory old data)
+      (store! code-ptr new)
+      old)))
+
+(define-syntax-rule (code-malloc tag data ...)
+  (code-mallocf (list tag data ...)))
+
+(define (data-mallocf data)
+  (let* ([old  data-ptr]
+         [new (+ old (length data))]
+         [in-gc (> (vector-length from-memory) 0)])
+    (begin
+      (vector-set-elements! data-memory old data)
+      (store! data-ptr new)
+      (if (< new (- MEMORY-SIZE 5))
+          old
+          (begin
+            (store! result-reg old)
+            (if in-gc
+                (error 'gc "out of memory")
+                (gc)))))))
+
+(define-syntax-rule (malloc tag data ...) (data-mallocf (list tag data ...)))
+
+(module+ test
+  (reset!)
+  (test/exn (code-mallocf (build-list (vector-length code-memory) identity))
+            "out of memory")
+  (reset!)
+  (swap-from-to)
+  (test/exn (data-mallocf (build-list (vector-length data-memory) identity))
+            "out of memory")
+  )
+
+;; parse : S-expr -> FLANG
+(define (parse-error sx)
+  (error 'parse (string-append "parse error: " (to-string sx))))
+
+(define (sx-ref sx n) (list-ref (s-exp->list sx) n))
+
+(define (parse sx)
+  (local
+      [(define (px i) (parse (sx-ref sx i)))]
+    (cond
+      [(s-exp-match? `empty sx) (EmptyList)]
+      [(s-exp-number? sx) (Num (s-exp->number sx))]
+      [(s-exp-symbol? sx) (Id (s-exp->symbol sx))]
+      [(s-exp-match? `(lam (SYMBOL) ANY) sx)
+       (let* ([args (sx-ref sx 1)]
+              [id (s-exp->symbol (sx-ref args 0))]
+              [body (px 2)])
+         (Lam id body))]
+      [(s-exp-match? `(first ANY) sx) (First (px 1))]
+      [(s-exp-match? `(rest ANY) sx) (Rest (px 1))]
+      [(s-exp-match? `(non-empty? ANY) sx) (NonEmpty? (px 1))]
+      [(s-exp-match? `(ANY ANY) sx) (Call (px 0) (px 1))]
+      [(s-exp-list? sx)
+       (case (s-exp->symbol (sx-ref sx 0))
+         [(cons) (Cons (px 1) (px 2))]
+         [(+) (Add (px 1) (px 2))]
+         [(-) (Sub (px 1) (px 2)) ]
+         [(if0) (If0 (px 1) (px 2) (px 3))]
+         [else (parse-error sx)])]
+      [else (parse-error sx)])))
+
+(module+ test
+  (test/exn (parse `{foo}) "parse error")
+  (test/exn (parse `"foo") "parse error")
+  (test (parse `3) (Num 3))
+  (test (parse `x) (Id 'x))
+  (test (parse `{+ 1 2}) (Add (Num 1) (Num 2)))
+  (test (parse `{- 1 2}) (Sub (Num 1) (Num 2)))
+  (test (parse `{cons 1 2}) (Cons (Num 1) (Num 2)))
+  (test (parse `{first {cons 1 2}}) (First (Cons (Num 1) (Num 2))))
+  (test (parse `{rest {cons 1 2}}) (Rest (Cons (Num 1) (Num 2))))
+  (test (parse `empty) (EmptyList))
+  (test (parse `{non-empty? x}) (NonEmpty? (Id 'x)))
+  (test (parse `{lam {x} x}) (Lam 'x (Id 'x)))
+  (test (parse `{f 2}) (Call (Id 'f) (Num 2)))
+  (test (parse `{if0 0 1 2}) (If0 (Num 0) (Num 1) (Num 2))))
+
+(define-type CompileEnv
+  [EmptyCompileEnv]
+  [CompileBind (name : Symbol)
+               (rest : CompileEnv)])
+
+(define (locate name cenv)
+  (type-case CompileEnv cenv
+    [(EmptyCompileEnv) (error 'locate "free variable")]
+    [(CompileBind sub-name rest-cenv)
+     (if (equal? sub-name name)
+         0
+         (+ 1 (locate name rest-cenv)))]))
+
+(module+ test
+  (test/exn (locate 'x (EmptyCompileEnv)) "free variable"))
+
+(define (compile ast cenv)
+  (type-case FLANG ast
+    [(EmptyList) (code-malloc tag:EmptyList)]
+    [(Num n) (code-malloc tag:Num n)]
+    [(Add l r) (code-malloc tag:Add
+                            (compile l cenv) (compile r cenv))]
+    [(Sub l r) (code-malloc tag:Sub
+                            (compile l cenv) (compile r cenv))]
+    [(Id name) (code-malloc tag:Id
+                            (locate name cenv))]
+    [(Lam param body-expr)
+     (code-malloc tag:Lam (compile body-expr (CompileBind param cenv)))]
+    [(Call fun-expr arg-expr)
+     (code-malloc tag:Call
+                  (compile fun-expr cenv)
+                  (compile arg-expr cenv))]
+    [(Cons f r) (code-malloc tag:Cons
+                             (compile f cenv) (compile r cenv))]
+    [(First expr) (code-malloc tag:First
+                               (compile expr cenv))]
+    [(Rest expr) (code-malloc tag:Rest
+                              (compile expr cenv))]
+    [(NonEmpty? expr) (code-malloc tag:NonEmpty? (compile expr cenv))]
+    [(If0 test-expr then-expr else-expr)
+     (code-malloc tag:If0
+                  (compile test-expr cenv)
+                  (compile then-expr cenv)
+                  (compile else-expr cenv))]))
+
+(module+ test
+  (reset!)
+  (test (compile (parse `empty) (EmptyCompileEnv)) 0)
+  (test (code-ref 0 0) tag:EmptyList)
+
+  (reset!)
+  (test (compile (parse `{non-empty? empty}) (EmptyCompileEnv)) 1)
+  (test (code-ref 1 0) tag:NonEmpty?)
+  (test (code-ref (code-ref 1 1) 0) tag:EmptyList))
+
+(define (interp)
+  (begin
+    (bctrace 'interp)
+    (case* (code-ref PC 0)
+           [(tag:EmptyList)
+            (store! v-reg (malloc tag:EmptyListV 0))
+            (continue)]
+           [(tag:Num)
+            (store! v-reg (malloc tag:NumV (code-ref PC 1)))
+            (continue)]
+           [(tag:Add)
+            (store! k-reg (malloc tag:addSecondK
+                                  (code-ref PC 2)
+                                  env-reg
+                                  k-reg))
+            (store! PC (code-ref PC 1))
+            (interp)]
+           [(tag:Cons)
+            (store! k-reg (malloc tag:consSecondK
+                                  (code-ref PC 2)
+                                  env-reg
+                                  k-reg))
+            (store! PC (code-ref PC 1))
+            (interp)]
+           [(tag:Sub)
+            (store! k-reg (malloc tag:subSecondK
+                                  (code-ref PC 2)
+                                  env-reg k-reg))
+            (store! PC (code-ref PC 1))
+            (interp)]
+           [(tag:NonEmpty?)
+            (store! k-reg (malloc tag:doNonEmpty?K k-reg))
+            (store! PC (code-ref PC 1))
+            (interp)]
+           [(tag:Id)
+            (store! env2-reg env-reg)
+            (store! v-reg (code-ref PC 1))
+            (env-ref)]
+           [(tag:Lam)
+            (store! v-reg (malloc tag:ClosureV (code-ref PC 1) env-reg))
+            (continue)]
+           [(tag:Call)
+            (store! k-reg (malloc tag:callArgK
+                                  (code-ref PC 2)
+                                  env-reg k-reg))
+            (store! PC (code-ref PC 1))
+            (interp)]
+           [(tag:If0)
+            (store! k-reg (malloc tag:doIfK
+                                  (code-ref PC 2)
+                                  (code-ref PC 3)
+                                  env-reg k-reg))
+            (store! PC (code-ref PC 1))
+            (interp)])))
+
+(define tag:EmptyCont 0)
+(define tag:addSecondK 1)
+(define tag:doAddK 2)
+(define tag:subSecondK 3)
+(define tag:doSubK 4)
+(define tag:callArgK 5)
+(define tag:doCallK 6)
+(define tag:doIfK 7)
+
+(define (continue)
+  (begin
+    (bctrace 'continue)
+    (case* (ref k-reg 0)
+           [(tag:EmptyCont) v-reg]
+           [(tag:addSecondK)
+            (store! PC (ref k-reg 1))
+            (store! env-reg (ref k-reg 2))
+            (store! k-reg (malloc tag:doAddK v-reg (ref k-reg 3)))
+            (interp)]
+           [(tag:doAddK)
+            (store! v-reg (num+ (ref k-reg 1) v-reg))
+            (store! k-reg (ref k-reg 2))
+            (continue)]
+           [(tag:consSecondK)
+            (store! PC (ref k-reg 1))
+            (store! env-reg (ref k-reg 2))
+            (store! k-reg (malloc tag:doConsK v-reg (ref k-reg 3)))
+            (interp)]
+           [(tag:doConsK)
+            (store! v-reg (num+ (ref k-reg 1) v-reg))
+            (store! k-reg (ref k-reg 2))
+            (continue)]
+           [(tag:subSecondK)
+            (store! PC (ref k-reg 1))
+            (store! env-reg (ref k-reg 2))
+            (store! k-reg (malloc tag:doSubK v-reg (ref k-reg 3)))
+            (interp)]
+           [(tag:doNonEmpty?K)
+            (store! v-reg (malloc tag:NumV (if (= (ref v-reg 0) tag:EmptyListV) 0 1)))
+            (store! k-reg (ref k-reg 1))
+            (continue)]
+           [(tag:doSubK)
+            (store! v-reg (num- (ref k-reg 1) v-reg))
+            (store! k-reg (ref k-reg 2))
+            (continue)]
+           [(tag:callArgK)
+            (store! PC (ref k-reg 1))
+            (store! env-reg (ref k-reg 2))
+            (store! k-reg (malloc tag:doCallK v-reg (ref k-reg 3)))
+            (interp)]
+           [(tag:doCallK)
+            (store! PC (ref (ref k-reg 1) 1))
+            (store! env-reg (malloc tag:Bind
+                                    v-reg
+                                    (ref (ref k-reg 1) 2)))
+            (store! k-reg (ref k-reg 2))
+            (interp)]
+           [(tag:doIfK)
+            (if (numzero? v-reg)
+                (store! PC (ref k-reg 1))
+                (store! PC (ref k-reg 2)))
+            (store! env-reg (ref k-reg 3))
+            (store! k-reg (ref k-reg 4))
+            (interp)])))
+
+;; num-op : (number number -> number) -> (FLANG-Value FLANG-Value -> FLANG-Value)
+(define (num-op op op-name)
+  (lambda (x y)
+    (malloc tag:NumV (op (ref x 1) (ref y 1)))))
+
+(define num+ (num-op + '+))
+(define num- (num-op - '-))
+
+;; numzero? : FLANG-Value -> boolean
+(define (numzero? x)
+  (zero? (ref x 1)))
+
+(define (env-ref)
+  (if (zero? v-reg)
+      (begin
+        (store! v-reg (ref env2-reg 1))
+        (continue))
+      (begin
+        (store! env2-reg (ref env2-reg 2))
+        (store! v-reg (- v-reg 1))
+        (env-ref))))
+
+(define (init-k) (malloc 0 0))
+(define (empty-env) (malloc 0 0))
+
+(define (interpx byte-code ds k)
+  (begin
+    (store! PC byte-code)
+    (store! env-reg ds)
+    (store! k-reg k)
+    (interp)))
+(define (numV x) (malloc tag:NumV x))
+
+(define (run s-exp) (begin (reset!) (interpx (compile (parse s-exp) (EmptyCompileEnv)) (empty-env) (init-k))))
+
+(define (swap-from-to)
+  (begin
+    (store! from-memory data-memory)
+    (if (eq? data-memory space1)
+        (store! data-memory space2)
+        (store! data-memory space1))
+    (store! data-ptr 0)))
+(define (move-roots)
+  (begin
+    (store! v-reg (move v-reg))
+    (store! env-reg (move env-reg))
+    (store! k-reg (move k-reg))
+    (store! result-reg (move result-reg))))
+
+(define (gc)
+  (begin
+    (bctrace 'gc)
+    (swap-from-to)
+    (move-roots)
+    (store! updated-ptr 0)
+    ;; Loop until there are no gray objects:
+    (update)))
+
+(define (move-from n slots)
+  (let ([where
+         (data-mallocf
+          (vector-elements from-memory
+                           n (add1 slots)))])
+    ;; Set forwarding pointer
+    (vector-set! from-memory (+ n 1) where)))
+
+(define (move n)
+  (begin
+    (case*
+     (vector-ref from-memory n)
+     [(tag:EmptyCont tag:NumV tag:EmptyListV tag:doNonEmpty?K)
+      (move-from n 1)]
+     [(tag:doAddK tag:doSubK tag:doCallK tag:ClosureV tag:Bind)
+      (move-from n 2)]
+     [(tag:addSecondK tag:subSecondK tag:callArgK) 
+      (move-from n 3)]
+     [(tag:addSecondK tag:subSecondK tag:callArgK)
+      (move-from n 3)]
+     [(tag:doIfK)
+      (move-from n 4)]
+     [(tag:Moved)
+      (void)])
+    ;; Change to gray:
+    (vector-set! from-memory n tag:Moved)
+    ;; Return forwarding pointer (that we just installed):
+    (vector-ref from-memory (+ n 1))))
+
+(module+ test
+  (reset!)
+  (test
+   (malloc tag:addSecondK (malloc tag:NumV 42) (empty-env) (init-k))
+   6))
+                
+(define (update)
+  (local 
+      [(define (update-slot! n)
+         (let* ([loc (+ updated-ptr n)]
+                [ptr-val (vector-ref data-memory loc)]
+                [dest (move ptr-val)])
+           (vector-set! data-memory loc dest)))
+       (define (advance n)
+         (begin
+           (store! updated-ptr (+ updated-ptr (+ n 1)))
+           (update)))
+       (define (done)
+         (begin
+           (store! from-memory (make-vector 0 0))
+           result-reg))]
+    (cond
+      [(= updated-ptr data-ptr) (done)] ;; no more gray
+      ;; updated-ptr points to first gray object:
+      [else
+       (case* (ref updated-ptr 0)
+              [(tag:EmptyCont tag:NumV tag:EmptyListV)
+               (advance 1)] ; int
+              [(tag:doNonEmpty?K)
+               (update-slot! 1)
+               (advance 1)] ; single pointer
+              [(tag:addSecondK tag:subSecondK tag:callArgK)
+               (update-slot! 2) ; int, pointer, pointer
+               (update-slot! 3)
+               (advance 3)]
+              [(tag:doAddK tag:doSubK tag:doCallK tag:Bind)
+               (update-slot! 1) ; pointer pointer
+               (update-slot! 2)
+               (advance 2)]
+              [(tag:ClosureV)
+               (update-slot! 2)
+               (advance 2)]
+              [(tag:doIfK)
+               (update-slot! 3)
+               (update-slot! 4)
+               (advance 4)])])))
+
+(define (reset!)
+  (begin
+    (store! code-ptr 0)
+    (store! data-ptr 0)
+    (store! v-reg 0)
+    (store! PC 0)
+    (store! k-reg 0)
+    (store! env-reg 0)
+    (store! result-reg 0)
+    (store! from-memory (make-vector 0 0))
+    (void)))
+
+(define (vtest a b)  (test (ref a 1) (ref b 1)))
+
+;; test for empty list
+(module+ test
+  
+  (define (read-int loc)
+    (if (= (ref loc 0) tag:NumV)
+        (ref loc 1)
+        (error 'read-int "expected number")))
+  
+  (test (read-int (run `42)) 42)
+  (test/exn (read-int (run `empty)) "expected number")
+  (test (ref (run `empty) 0) tag:EmptyListV)
+  (test (read-int (run `{non-empty? empty})) 0)
+
+(let ([result (run `{cons 1 2})])
+  (begin
+    (test (ref result 0) tag:ConsV) 
+    (test (read-int (ref result 1)) 1)
+    (test (read-int (ref result 2)) 2))))
+
+;; test for memory usage
+(module+ test
+  (define (fib-src m)
+    `{{lam {mkrec}
+           {{lam {fib} {fib ,(number->s-exp m)}}
+            {mkrec
+             {lam {fib}
+                  {lam {n}
+                       {if0 n 1
+                            {if0 {- n 1} 1
+                                 {+ {fib {- n 1}}
+                                    {fib {- n 2}}}}}}}}}}
+      {lam {body-proc}
+           {{lam {fX} {fX fX}}
+            {lam {fX} {body-proc {lam {x} {{fX fX} x}}}}}}})
+
+  (test MEMORY-SIZE 128)
+
+
+
+
+  (reset!)
+  (vtest (run (fib-src 5)) (numV 8))
+  (test code-ptr 109)
+  (test data-ptr 116)
+  
+ 
+
+)
+
+(reset!)
+(test (compile (parse `{cons 1 2}) (EmptyCompileEnv)) 4)
+(test (vector-elements code-memory 0 7)
+        (list tag:Num 1 tag:Num 2 tag:Cons 0 2))
+
+(reset!)
+(test (compile (parse `{first {cons 1 2}}) (EmptyCompileEnv)) 7)
+(test (vector-elements code-memory 0 9)
+        (list tag:Num 1 tag:Num 2 tag:Cons 0 2 tag:First 4))
+
+(reset!)
+(test (compile (parse `{rest {cons 1 2}}) (EmptyCompileEnv)) 7)
+(test (vector-elements code-memory 0 9)
+      (list tag:Num 1 tag:Num 2 tag:Cons 0 2 tag:Rest 4))
+  
